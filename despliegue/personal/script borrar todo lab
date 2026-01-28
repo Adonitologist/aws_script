@@ -1,0 +1,120 @@
+import boto3
+import botocore
+import time
+from botocore.exceptions import ClientError
+
+def wait_with_log(seconds, message):
+    print(f"   - {message}. Esperando {seconds} segundos...")
+    time.sleep(seconds)
+
+def cleanup_pro():
+    ec2 = boto3.client('ec2')
+    ec2_res = boto3.resource('ec2')
+    s3_res = boto3.resource('s3')
+    
+    print("\n🚀 INICIANDO LIMPIEZA AGRESIVA DEL LAB...")
+
+    # 1. INSTANCIAS EC2
+    print("\n[1/5] Terminando instancias EC2...")
+    instances = ec2_res.instances.all()
+    active_instances = [i.id for i in instances if i.state['Name'] != 'terminated']
+    
+    if active_instances:
+        ec2.terminate_instances(InstanceIds=active_instances)
+        print(f"   - Terminando: {active_instances}")
+        waiter = ec2.get_waiter('instance_terminated')
+        waiter.wait(InstanceIds=active_instances)
+        print("   ✅ Instancias terminadas.")
+    else:
+        print("   - No hay instancias activas.")
+
+    # 2. NAT GATEWAYS (El mayor bloqueador)
+    print("\n[2/5] Buscando NAT Gateways (esto suele tardar)...")
+    nats = ec2.describe_nat_gateways(Filters=[{'Name': 'state', 'Values': ['available', 'pending']}])['NatGateways']
+    for nat in nats:
+        nat_id = nat['NatGatewayId']
+        print(f"   - Eliminando NAT Gateway: {nat_id}")
+        ec2.delete_nat_gateway(NatGatewayId=nat_id)
+        
+        # Esperar a que el NAT Gateway se borre de verdad
+        while True:
+            status = ec2.describe_nat_gateways(NatGatewayIds=[nat_id])['NatGateways'][0]['State']
+            if status == 'deleted':
+                print(f"   ✅ NAT Gateway {nat_id} borrado.")
+                break
+            print(f"   ... Estado actual: {status}. Esperando 15s...")
+            time.sleep(15)
+
+    # 3. VPCS PERSONALIZADAS Y SUS DEPENDENCIAS
+    print("\n[3/5] Analizando VPCs no predeterminadas...")
+    vpcs = ec2.describe_vpcs()['Vpcs']
+    for vpc in vpcs:
+        if vpc['IsDefault']: continue
+        
+        vpc_id = vpc['VpcId']
+        print(f"\n👉 Procesando VPC: {vpc_id}")
+
+        # A. Limpiar Security Groups (Primero vaciar reglas para romper dependencias circulares)
+        sgs = ec2.describe_security_groups(Filters=[{'Name': 'vpc-id', 'Values': [vpc_id]}])['SecurityGroups']
+        for sg in sgs:
+            if sg['GroupName'] == 'default': continue
+            try:
+                print(f"   - Limpiando reglas del SG: {sg['GroupId']}")
+                if sg['IpPermissions']:
+                    ec2.revoke_security_group_ingress(GroupId=sg['GroupId'], IpPermissions=sg['IpPermissions'])
+                if sg['IpPermissionsEgress']:
+                    ec2.revoke_security_group_egress(GroupId=sg['GroupId'], IpPermissions=sg['IpPermissionsEgress'])
+            except Exception as e: print(f"     Aviso reglas: {e}")
+
+        # B. Borrar Security Groups, Subnets e IGWs con REINTENTOS
+        def retry_delete(func, resource_id, name):
+            for attempt in range(1, 7): # 6 intentos = 1 minuto de margen
+                try:
+                    func()
+                    print(f"   ✅ {name} {resource_id} borrado.")
+                    return True
+                except ClientError as e:
+                    print(f"   ⚠️ {name} {resource_id} ocupado, reintento {attempt}/6...")
+                    time.sleep(10)
+            return False
+
+        # Borrar SGs
+        for sg in sgs:
+            if sg['GroupName'] != 'default':
+                retry_delete(lambda: ec2.delete_security_group(GroupId=sg['GroupId']), sg['GroupId'], "SG")
+
+        # C. Internet Gateways
+        igws = ec2.describe_internet_gateways(Filters=[{'Name': 'attachment.vpc-id', 'Values': [vpc_id]}])['InternetGateways']
+        for igw in igws:
+            igw_id = igw['InternetGatewayId']
+            ec2.detach_internet_gateway(InternetGatewayId=igw_id, VpcId=vpc_id)
+            ec2.delete_internet_gateway(InternetGatewayId=igw_id)
+            print(f"   ✅ IGW {igw_id} desvinculado y borrado.")
+
+        # D. Subnets
+        subnets = ec2.describe_subnets(Filters=[{'Name': 'vpc-id', 'Values': [vpc_id]}])['Subnets']
+        for sub in subnets:
+            retry_delete(lambda: ec2.delete_subnet(SubnetId=sub['SubnetId']), sub['SubnetId'], "Subnet")
+
+        # E. Borrado final de la VPC
+        retry_delete(lambda: ec2.delete_vpc(VpcId=vpc_id), vpc_id, "VPC")
+
+    # 4. VOLÚMENES EBS
+    print("\n[4/5] Limpiando volúmenes EBS sueltos...")
+    for vol in ec2_res.volumes.all():
+        if vol.state == 'available':
+            vol.delete()
+            print(f"   ✅ Volumen {vol.id} borrado.")
+
+    # 5. S3 BUCKETS
+    print("\n[5/5] Vaciando y borrando buckets S3...")
+    for bucket in s3_res.buckets.all():
+        print(f"   - Procesando bucket: {bucket.name}")
+        bucket.objects.all().delete()
+        bucket.delete()
+        print(f"   ✅ Bucket {bucket.name} borrado.")
+
+    print("\n✨ LIMPIEZA COMPLETA. El laboratorio está despejado. ✨\n")
+
+if __name__ == "__main__":
+    cleanup_pro()

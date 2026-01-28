@@ -1,0 +1,49 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: RDS con Seguridad Encadenada
+
+Parameters:
+  DBPassword:
+    Type: String
+    NoEcho: true
+    Description: Password para la base de datos.
+  EnvironmentType:
+    Type: String
+    Default: dev
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Default: vockey
+
+Resources:
+  # Grupo de seguridad para EC2
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Permite acceso a la EC2
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+
+  # Grupo de seguridad para RDS (Encadenado a EC2)
+  RDSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Solo permite trafico desde el SG de la EC2
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432 # Puerto PostgreSQL indicado
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref EC2SecurityGroup # "Encadenamiento"
+
+  # Instancia RDS
+  MyRDSInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      AllocatedStorage: '20'
+      DBInstanceClass: db.t3.micro
+      Engine: postgres
+      MasterUsername: dbadmin
+      MasterUserPassword: !Ref DBPassword
+      VPCSecurityGroups:
+        - !Ref RDSSecurityGroup
