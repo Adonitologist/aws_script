@@ -1,49 +1,96 @@
-AWSTemplateFormatVersion: '2010-09-09'
-Description: RDS con Seguridad Encadenada
+AWSTemplateFormatVersion: 2010-09-09
+Description: Part 2 - Fixed Security Group chaining for MySQL
 
 Parameters:
-  DBPassword:
-    Type: String
-    NoEcho: true
-    Description: Password para la base de datos.
+  AvailabilityZone:
+    Type: AWS::EC2::AvailabilityZone::Name
   EnvironmentType:
     Type: String
     Default: dev
+    AllowedValues: [dev, test, prod]
+  AmiID:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
   KeyPairName:
-    Type: AWS::EC2::KeyPair::KeyName
-    Default: vockey
+    Type: String
+  DBInstanceIdentifier:
+    Type: String
+    Default: "webapp-db"
+  DBUsername:
+    NoEcho: "true"
+    Type: String
+    Default: "mysqladmin"
+  DBPassword:
+    NoEcho: "true"
+    Type: String
+  DBName:
+    Type: String
+    Default: "webapp"
+
+Mappings:
+  EnvironmentToInstanceType:
+    dev: {InstanceType: t2.nano}
+    test: {InstanceType: t2.micro}
+    prod: {InstanceType: t2.small}
 
 Resources:
-  # Grupo de seguridad para EC2
-  EC2SecurityGroup:
-    Type: AWS::EC2::SecurityGroup
+  WebAppInstance:
+    Type: AWS::EC2::Instance
     Properties:
-      GroupDescription: Permite acceso a la EC2
-      SecurityGroupIngress:
-        - IpProtocol: tcp
-          FromPort: 22
-          ToPort: 22
-          CidrIp: 0.0.0.0/0
+      AvailabilityZone: !Ref AvailabilityZone
+      ImageId: !Ref AmiID
+      InstanceType: !FindInMap [EnvironmentToInstanceType, !Ref EnvironmentType, InstanceType]
+      KeyName: !Ref KeyPairName
+      SecurityGroupIds: [!Ref WebAppSecurityGroup]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          yum update -y
+          yum install -y mariadb
 
-  # Grupo de seguridad para RDS (Encadenado a EC2)
-  RDSSecurityGroup:
+  WebAppSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Solo permite trafico desde el SG de la EC2
+      GroupName: !Join ["-", [webapp-sg, !Ref EnvironmentType]]
+      GroupDescription: "Allow HTTP/HTTPS and SSH inbound"
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0}
+        - {IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0}
+        - {IpProtocol: tcp, FromPort: 22, ToPort: 22, CidrIp: 0.0.0.0/0}
+
+  DBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "Allow DB traffic only from the WebApp Security Group"
       SecurityGroupIngress:
         - IpProtocol: tcp
-          FromPort: 5432 # Puerto PostgreSQL indicado
+          FromPort: 5432 # Use 5432 for MySQL to avoid engine conflicts
           ToPort: 5432
-          SourceSecurityGroupId: !Ref EC2SecurityGroup # "Encadenamiento"
+          SourceSecurityGroupId: !GetAtt WebAppSecurityGroup.GroupId # FIXED: Gets sg-xxx instead of the name
 
-  # Instancia RDS
-  MyRDSInstance:
+  WebAppEIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      InstanceId: !Ref WebAppInstance
+
+  WebAppDatabase:
     Type: AWS::RDS::DBInstance
     Properties:
-      AllocatedStorage: '20'
+      DBInstanceIdentifier: !Ref DBInstanceIdentifier
+      VPCSecurityGroups: [!GetAtt DBSecurityGroup.GroupId]
+      AllocatedStorage: "20"
       DBInstanceClass: db.t3.micro
-      Engine: postgres
-      MasterUsername: dbadmin
+      Engine: mysql
+      MasterUsername: !Ref DBUsername
       MasterUserPassword: !Ref DBPassword
-      VPCSecurityGroups:
-        - !Ref RDSSecurityGroup
+      DBName: !Ref DBName
+      Port: "5432"
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+
+Outputs:
+  WebsiteURL:
+    Value: !Sub http://${WebAppEIP}
+  WebAppDatabaseEndpoint:
+    Value: !GetAtt WebAppDatabase.Endpoint.Address
