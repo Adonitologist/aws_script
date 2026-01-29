@@ -1,0 +1,69 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: "Práctica 3 - Ejercicio 3 - S3 con Políticas y Mapeos"
+
+Parameters:
+  AccessLevel:
+    Type: String
+    Default: Private
+    AllowedValues: [Private, Public]
+    Description: "Nivel de acceso para el bucket"
+  
+  StorageType:
+    Type: String
+    Default: Dev
+    AllowedValues: [Dev, Prod]
+    Description: "Entorno para determinar el tipo de almacenamiento"
+
+Mappings:
+  StorageConfig:
+    Dev:
+      Tier: Standard
+    Prod:
+      Tier: Intelligent-Tiering
+
+Resources:
+  # 1. Creación del Bucket S3
+  MyS3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      # El tipo de almacenamiento se define en la configuración de ciclo de vida o al subir objetos,
+      # pero aquí cumplimos el mapeo aplicándolo a etiquetas o configuraciones.
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      Tags:
+        - Key: StorageTier
+          Value: !FindInMap [StorageConfig, !Ref StorageType, Tier]
+
+  # 2. Política de Bucket Dinámica según el parámetro AccessLevel
+  BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref MyS3Bucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AccessControl
+            Effect: !If [IsPublic, Allow, Deny]
+            Principal: "*"
+            Action: "s3:GetObject"
+            Resource: !Sub "arn:aws:s3:::${MyS3Bucket}/*"
+            # Esta condición hace que si es Private, el Deny sea efectivo o la política cambie
+            Condition:
+              Bool:
+                "aws:SecureTransport": "true"
+
+Conditions:
+  IsPublic: !Equals [ !Ref AccessLevel, "Public" ]
+
+Outputs:
+  BucketARN:
+    Description: "ARN del bucket"
+    Value: !GetAtt MyS3Bucket.Arn
+  
+  UploadURL:
+    Description: "URL de carga de archivos (S3 Console)"
+    Value: !Sub "https://s3.console.aws.amazon.com/s3/buckets/${MyS3Bucket}"

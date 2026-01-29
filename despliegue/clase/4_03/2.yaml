@@ -1,0 +1,61 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: "Práctica 3 - Ejercicio 2 - RDS MySQL Multi-AZ Automatizado"
+
+Parameters:
+  DBUser:
+    Type: String
+    Default: admin
+  DBPassword:
+    Type: String
+    NoEcho: true
+  Environment:
+    Type: String
+    Default: Dev
+    AllowedValues: [Dev, Prod]
+
+Mappings:
+  InstanceConfig:
+    Dev:
+      Class: db.t3.micro
+    Prod:
+      Class: db.m5.large
+
+Resources:
+  # Grupo de subredes: Importa las subredes del Ejercicio 1
+  MyDBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: "Subredes para RDS"
+      SubnetIds:
+        - !ImportValue Practica1VPC-PrivateSubnet1
+        - !ImportValue Practica1VPC-PrivateSubnet2
+
+  # Security Group: Importa la VPC del Ejercicio 1
+  RDSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "Acceso MySQL"
+      VpcId: !ImportValue Practica1VPC-VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          CidrIp: 20.0.0.0/16
+
+  # Instancia RDS
+  MyRDSInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      Engine: mysql
+      MultiAZ: true
+      DBInstanceClass: !FindInMap [InstanceConfig, !Ref Environment, Class]
+      MasterUsername: !Ref DBUser
+      MasterUserPassword: !Ref DBPassword
+      DBSubnetGroupName: !Ref MyDBSubnetGroup
+      VPCSecurityGroups:
+        - !Ref RDSSecurityGroup
+      AllocatedStorage: '20'
+
+Outputs:
+  DBEndpoint:
+    Value: !GetAtt MyRDSInstance.Endpoint.Address
