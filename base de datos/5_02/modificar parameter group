@@ -1,0 +1,7 @@
+aws rds modify-db-parameter-group `
+  --db-parameter-group-name mysql-parameter-group-juaneslava `
+  --parameters `
+    "ParameterName=slow_query_log,ParameterValue=1,ApplyMethod=immediate" `
+    "ParameterName=long_query_time,ParameterValue=2,ApplyMethod=immediate" `
+    "ParameterName=log_queries_not_using_indexes,ParameterValue=1,ApplyMethod=immediate" `
+    "ParameterName=max_connections,ParameterValue=200,ApplyMethod=pending-reboot"

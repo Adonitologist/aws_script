@@ -1,0 +1,4 @@
+aws rds modify-db-instance `
+  --db-instance-identifier database-2 `
+  --db-parameter-group-name mysql-parameter-group-juaneslava `
+  --apply-immediately
