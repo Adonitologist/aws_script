@@ -1,0 +1,84 @@
+#!/bin/bash
+export AWS_PAGER=""
+
+# --- CONFIGURACIÓN ---
+DB_ID="rds-privada-2"
+DB_USER="admin"
+DB_PASS="adminadmin"
+EC2_NAME="2_EC2"
+SG_NAME="sg_2_db_ec2"
+KEY_NAME="vockey"
+
+echo "--- 1. CONFIGURANDO SECURITY GROUP ---"
+SG_ID=$(aws ec2 describe-security-groups --group-names "$SG_NAME" --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null)
+
+if [ "$SG_ID" == "None" ] || [ -z "$SG_ID" ]; then
+    SG_ID=$(aws ec2 create-security-group --group-name "$SG_NAME" --description "Acceso privado RDS-EC2" --query 'GroupId' --output text)
+    echo "SG Creado: $SG_ID"
+else
+    echo "Usando SG existente: $SG_ID"
+fi
+
+# Reglas esenciales: SSH para ti y MySQL interno para la comunicación entre ellos
+aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port 22 --cidr 0.0.0.0/0 2>/dev/null
+aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port 3306 --source-group $SG_ID 2>/dev/null
+
+echo "--- 2. CONFIGURANDO EC2 UBUNTU ---"
+AMI_ID=$(aws ec2 describe-images --owners 099720109477 --filters "Name=name,Values=ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*" --query 'sort_by(Images, &CreationDate)[-1].ImageId' --output text)
+
+EC2_ID=$(aws ec2 describe-instances --filters "Name=tag:Name,Values=$EC2_NAME" "Name=instance-state-name,Values=running,pending" --query 'Reservations[0].Instances[0].InstanceId' --output text 2>/dev/null)
+
+if [ "$EC2_ID" == "None" ] || [ -z "$EC2_ID" ]; then
+    USER_DATA=$(cat <<DATA
+#!/bin/bash
+apt-get update -y
+apt-get install -y mysql-client
+DATA
+)
+    EC2_ID=$(aws ec2 run-instances --image-id $AMI_ID --count 1 --instance-type t3.micro --key-name $KEY_NAME --security-group-ids $SG_ID --user-data "$USER_DATA" --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$EC2_NAME}]" --query 'Instances[0].InstanceId' --output text)
+    echo "Nueva EC2 lanzada: $EC2_ID"
+else
+    echo "Reutilizando EC2: $EC2_ID."
+    aws ec2 modify-instance-attribute --instance-id $EC2_ID --groups $SG_ID
+fi
+
+echo "--- 3. GESTIONANDO RDS PRIVADA ---"
+RDS_STATUS=$(aws rds describe-db-instances --db-instance-identifier "$DB_ID" --query 'DBInstances[0].DBInstanceStatus' --output text 2>/dev/null)
+
+if [ "$RDS_STATUS" == "deleting" ]; then
+    echo "Esperando a que se elimine la instancia anterior..."
+    aws rds wait db-instance-deleted --db-instance-identifier "$DB_ID"
+    RDS_STATUS="None"
+fi
+
+if [ -z "$RDS_STATUS" ] || [ "$RDS_STATUS" == "None" ]; then
+    echo "Creando nueva RDS PRIVADA..."
+    aws rds create-db-instance \
+        --db-instance-identifier "$DB_ID" \
+        --db-instance-class db.t3.micro \
+        --engine mysql \
+        --allocated-storage 20 \
+        --master-username "$DB_USER" \
+        --master-user-password "$DB_PASS" \
+        --vpc-security-group-ids "$SG_ID" \
+        --no-publicly-accessible \
+        --no-multi-az
+else
+    echo "La RDS ya existe (Estado: $RDS_STATUS)."
+fi
+
+echo "Esperando a que la RDS esté disponible..."
+aws rds wait db-instance-available --db-instance-identifier "$DB_ID"
+
+ENDPOINT=$(aws rds describe-db-instances --db-instance-identifier "$DB_ID" --query 'DBInstances[0].Endpoint.Address' --output text)
+EC2_IP=$(aws ec2 describe-instances --instance-ids $EC2_ID --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+
+echo "------------------------------------------------"
+echo "¡TERMINADO!"
+echo "IP EC2: $EC2_IP"
+echo "RDS Endpoint: $ENDPOINT"
+echo "------------------------------------------------"
+echo "PASOS PARA CONECTAR:"
+echo "1. ssh -i ~/labsuser.pem ubuntu@$EC2_IP"
+echo "2. mysql -h $ENDPOINT -u $DB_USER -p$DB_PASS"
+echo "------------------------------------------------"
