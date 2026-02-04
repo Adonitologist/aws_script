@@ -1,0 +1,53 @@
+#!/bin/bash
+export AWS_PAGER=""
+DB_ID="rds-publica-1"
+DB_USER="admin"
+DB_PASS="adminadmin"
+EC2_NAME="1_EC2"
+SG_NAME="sg_1_db_ec2"
+KEY_NAME="vockey"
+
+echo "--- 1. SECURITY GROUP ---"
+SG_ID=$(aws ec2 describe-security-groups --group-names "$SG_NAME" --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null)
+if [ "$SG_ID" == "None" ] || [ -z "$SG_ID" ]; then
+    SG_ID=$(aws ec2 create-security-group --group-name "$SG_NAME" --description "Acceso RDS y EC2" --query 'GroupId' --output text)
+    aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port 22 --cidr 0.0.0.0/0
+    aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port 3306 --cidr 0.0.0.0/0
+fi
+
+echo "--- 2. AMI Y EC2 ---"
+AMI_ID=$(aws ec2 describe-images --owners 099720109477 --filters "Name=name,Values=ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*" --query 'sort_by(Images, &CreationDate)[-1].ImageId' --output text)
+EC2_ID=$(aws ec2 describe-instances --filters "Name=tag:Name,Values=$EC2_NAME" "Name=instance-state-name,Values=running,pending" --query 'Reservations[0].Instances[0].InstanceId' --output text 2>/dev/null)
+if [ "$EC2_ID" == "None" ] || [ -z "$EC2_ID" ]; then
+    USER_DATA=$(cat <<DATA
+#!/bin/bash
+apt-get update -y
+apt-get install -y mysql-client
+DATA
+)
+    EC2_ID=$(aws ec2 run-instances --image-id $AMI_ID --count 1 --instance-type t3.micro --key-name $KEY_NAME --security-group-ids $SG_ID --user-data "$USER_DATA" --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$EC2_NAME}]" --query 'Instances[0].InstanceId' --output text)
+fi
+
+echo "--- 3. GESTIÓN RDS ---"
+RDS_STATUS=$(aws rds describe-db-instances --db-instance-identifier "$DB_ID" --query 'DBInstances[0].DBInstanceStatus' --output text 2>/dev/null)
+
+if [ "$RDS_STATUS" == "deleting" ]; then
+    echo "Esperando a que termine de borrarse..."
+    aws rds wait db-instance-deleted --db-instance-identifier "$DB_ID"
+    RDS_STATUS="None"
+fi
+
+if [ -z "$RDS_STATUS" ] || [ "$RDS_STATUS" == "None" ]; then
+    echo "Creando RDS..."
+    aws rds create-db-instance --db-instance-identifier "$DB_ID" --db-instance-class db.t3.micro --engine mysql --allocated-storage 20 --master-username "$DB_USER" --master-user-password "$DB_PASS" --vpc-security-group-ids "$SG_ID" --publicly-accessible --no-multi-az
+fi
+
+echo "Esperando a que esté disponible..."
+aws rds wait db-instance-available --db-instance-identifier "$DB_ID"
+
+ENDPOINT=$(aws rds describe-db-instances --db-instance-identifier "$DB_ID" --query 'DBInstances[0].Endpoint.Address' --output text)
+echo "------------------------------------------------"
+echo "¡LISTO! Endpoint: $ENDPOINT"
+echo "Conexión: mysql -h $ENDPOINT -u $DB_USER -p$DB_PASS"
+echo "------------------------------------------------"
+EOF
