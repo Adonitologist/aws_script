@@ -1,0 +1,41 @@
+#!/bin/bash
+export AWS_PAGER=""
+
+echo "Introduce el ID de la base de datos origen (Blue):"
+read DB_ID
+
+# 1. DETECTAR ARN Y FAMILIA SIN JQ
+echo "Detectando configuración de $DB_ID..."
+DB_INFO=$(aws rds describe-db-instances --db-instance-identifier "$DB_ID" --output text)
+
+# Extraemos el ARN (suele ser el segundo campo en la salida de texto)
+DB_ARN=$(aws rds describe-db-instances --db-instance-identifier "$DB_ID" --query "DBInstances[0].DBInstanceArn" --output text)
+
+# Forzamos la familia a mysql8.4 basándonos en tus logs anteriores
+FAMILY="mysql8.4"
+
+DEPLOYMENT_NAME="bg-deploy-${DB_ID}"
+PARAM_GROUP_NAME="params-bg-${DB_ID}-v5"
+
+echo "--- 1. CREANDO GRUPO DE PARÁMETROS (Familia: $FAMILY) ---"
+aws rds create-db-parameter-group \
+    --db-parameter-group-name "$PARAM_GROUP_NAME" \
+    --db-parameter-group-family "$FAMILY" \
+    --description "Grupo para despliegue Blue-Green de $DB_ID"
+
+echo "--- 2. INICIANDO DESPLIEGUE BLUE/GREEN ---"
+aws rds create-blue-green-deployment \
+    --blue-green-deployment-name "$DEPLOYMENT_NAME" \
+    --source "$DB_ARN" \
+    --target-db-parameter-group-name "$PARAM_GROUP_NAME"
+
+echo "--- 3. VERIFICANDO GRUPOS DE PARÁMETROS ---"
+aws rds describe-db-parameter-groups \
+    --query 'DBParameterGroups[?contains(DBParameterGroupName, `params`)].{Name:DBParameterGroupName, Family:DBParameterGroupFamily}' \
+    --output table
+
+echo "------------------------------------------------"
+echo "¡ENTORNO BLUE/GREEN LANZADO!"
+echo "ID Origen: $DB_ID"
+echo "Nuevo Parameter Group: $PARAM_GROUP_NAME"
+echo "------------------------------------------------"

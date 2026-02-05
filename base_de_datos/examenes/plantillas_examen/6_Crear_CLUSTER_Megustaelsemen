@@ -1,0 +1,45 @@
+#!/bin/bash
+export AWS_PAGER=""
+
+echo "Introduce un prefijo para los nombres (SOLO letras y números, ej: cluster-insano):"
+read PREFIJO
+
+# 1. CREAR RDS MYSQL ESTÁNDAR MULTI-AZ
+echo "--- 1. CREANDO RDS MYSQL MULTI-AZ (INSTANCIA) ---"
+aws rds create-db-instance \
+    --db-instance-identifier "${PREFIJO}-std-maz" \
+    --db-instance-class db.t3.micro \
+    --engine mysql \
+    --allocated-storage 20 \
+    --master-username admin \
+    --master-user-password adminadmin \
+    --multi-az \
+    --no-publicly-accessible
+
+# 2. CREAR CLUSTER AURORA
+echo "--- 2. CREANDO CLUSTER AURORA MYSQL ---"
+# Eliminamos --engine-version para que use la por defecto de la región
+aws rds create-db-cluster \
+    --db-cluster-identifier "${PREFIJO}-aurora-cluster" \
+    --engine aurora-mysql \
+    --master-username admin \
+    --master-user-password adminadmin \
+    --db-subnet-group-name default
+
+echo "Esperando 15 segundos para asegurar que el cluster existe en el catálogo..."
+sleep 15
+
+# 3. CREAR INSTANCIA DENTRO DEL CLUSTER AURORA
+echo "--- 3. CREANDO INSTANCIA DENTRO DEL CLUSTER AURORA ---"
+# Usamos t3.medium porque Aurora suele requerir esta clase como mínimo en labs
+aws rds create-db-instance \
+    --db-instance-identifier "${PREFIJO}-aurora-node-1" \
+    --db-cluster-identifier "${PREFIJO}-aurora-cluster" \
+    --db-instance-class db.t3.medium \
+    --engine aurora-mysql
+
+echo "------------------------------------------------"
+echo "¡PROCESO DE CREACIÓN LANZADO!"
+echo "RDS Multi-AZ: ${PREFIJO}-std-maz"
+echo "Aurora Cluster: ${PREFIJO}-aurora-cluster"
+echo "------------------------------------------------"

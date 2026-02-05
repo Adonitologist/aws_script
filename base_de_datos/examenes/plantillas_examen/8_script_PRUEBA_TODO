@@ -1,0 +1,45 @@
+#!/bin/bash
+export AWS_PAGER=""
+
+echo "=========================================================="
+echo "   REVISIÓN TÉCNICA FINAL - ESPECIALIZACIÓN BD 2026       "
+echo "=========================================================="
+
+# 1. PRUEBA DE PROXY (Conectividad lógica)
+echo -e "\n[1] TEST: RDS PROXY"
+PROXY_STATUS=$(aws rds describe-db-proxies --query 'DBProxies[0].Status' --output text)
+if [ "$PROXY_STATUS" == "available" ]; then
+    echo "✅ PROXY OPERATIVO: $(aws rds describe-db-proxies --query 'DBProxies[0].Endpoint' --output text)"
+else
+    echo "⚠️  PROXY EN ESTADO: $PROXY_STATUS (Espera un poco más)"
+fi
+
+# 2. VERIFICACIÓN DE ALTA DISPONIBILIDAD (Multi-AZ)
+echo -e "\n[2] TEST: ARQUITECTURAS DE ALTA DISPONIBILIDAD"
+echo "--- RDS Estándar Multi-AZ ---"
+aws rds describe-db-instances \
+    --query 'DBInstances[?MultiAZ==`true`].{ID:DBInstanceIdentifier,AZ:AvailabilityZone,Status:DBInstanceStatus}' \
+    --output table
+
+echo "--- Aurora Cluster (Storage Auto-Replicated) ---"
+aws rds describe-db-clusters \
+    --query 'DBClusters[*].{ClusterID:DBClusterIdentifier,Engine:Engine,Status:Status}' \
+    --output table
+
+# 3. VERIFICACIÓN DEL ENTORNO BLUE/GREEN
+echo -e "\n[3] TEST: DESPLIEGUE BLUE/GREEN"
+aws rds describe-blue-green-deployments \
+    --query 'BlueGreenDeployments[*].{Name:BlueGreenDeploymentName,Status:Status}' \
+    --output table
+
+# 4. PRUEBA DE INTEGRIDAD DE PARÁMETROS
+echo -e "\n[4] TEST: GRUPOS DE PARÁMETROS (V3 y V5)"
+aws rds describe-db-parameter-groups \
+    --query 'DBParameterGroups[?contains(DBParameterGroupName, `params`)].{Name:DBParameterGroupName,Family:DBParameterGroupFamily}' \
+    --output table
+
+# 5. VERIFICACIÓN DE SEGURIDAD (Backups y Snapshots)
+echo -e "\n[5] TEST: PROTECCIÓN DE DATOS"
+PLAN_BACKUP=$(aws backup list-backup-plans --query 'BackupPlansList[0].BackupPlanName' --output text)
+if [ "$PLAN_BACKUP" != "None" ]; then
+    echo "✅ PLAN DE BACKUP DETECTADO: $

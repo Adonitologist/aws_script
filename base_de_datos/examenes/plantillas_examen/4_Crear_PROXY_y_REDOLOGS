@@ -1,0 +1,54 @@
+#!/bin/bash
+export AWS_PAGER=""
+
+echo "Introduce el ID de la RDS existente (ej: rds-publica-1):"
+read DB_ID
+
+PARAM_GROUP_NAME="${DB_ID}-params-v3"
+PROXY_NAME="${DB_ID}-proxy-v3"
+SECRET_NAME="${DB_ID}-secret-v3"
+
+# En Learner Lab, usamos LabRole obligatoriamente
+ROLE_ARN=$(aws iam get-role --role-name LabRole --query 'Role.Arn' --output text)
+
+echo "--- 1. CONFIGURANDO REDO LOGS (Sintaxis MySQL 8.4) ---"
+aws rds create-db-parameter-group \
+    --db-parameter-group-name "$PARAM_GROUP_NAME" \
+    --db-parameter-group-family "mysql8.4" \
+    --description "Ajuste logs 8.4 v3" 2>/dev/null
+
+# En 8.4 usamos innodb_redo_log_capacity (ej: 512MB)
+aws rds modify-db-parameter-group \
+    --db-parameter-group-name "$PARAM_GROUP_NAME" \
+    --parameters "ParameterName=innodb_redo_log_capacity,ParameterValue=536870912,ApplyMethod=pending-reboot"
+
+aws rds modify-db-instance \
+    --db-instance-identifier "$DB_ID" \
+    --db-parameter-group-name "$PARAM_GROUP_NAME" \
+    --apply-immediately
+
+echo "--- 2. CREANDO SECRETO ---"
+SECRET_ARN=$(aws secretsmanager create-secret \
+    --name "$SECRET_NAME" \
+    --secret-string "{\"username\":\"admin\",\"password\":\"adminadmin\"}" \
+    --query 'ARN' --output text 2>/dev/null || aws secretsmanager describe-secret --secret-id "$SECRET_NAME" --query 'ARN' --output text)
+
+echo "--- 3. CREANDO RDS PROXY (Sintaxis Corregida) ---"
+SUBNET_IDS=$(aws rds describe-db-instances --db-instance-identifier "$DB_ID" --query 'DBInstances[0].DBSubnetGroup.Subnets[*].SubnetIdentifier' --output text)
+SG_ID=$(aws rds describe-db-instances --db-instance-identifier "$DB_ID" --query 'DBInstances[0].VpcSecurityGroups[0].VpcSecurityGroupId' --output text)
+
+# Eliminado 'UserName' de la sección --auth para evitar el error de validación
+aws rds create-db-proxy \
+    --db-proxy-name "$PROXY_NAME" \
+    --engine-family MYSQL \
+    --auth "AuthScheme=SECRETS,SecretArn=$SECRET_ARN" \
+    --role-arn "$ROLE_ARN" \
+    --vpc-subnet-ids $SUBNET_IDS \
+    --vpc-security-group-ids "$SG_ID"
+
+echo "------------------------------------------------"
+echo "¡PROCESO FINALIZADO!"
+echo "ID Proxy: $PROXY_NAME"
+echo "ID Parameter Group: $PARAM_GROUP_NAME"
+echo "RECUERDA: Debes reiniciar la RDS para que los logs cambien."
+echo "------------------------------------------------"

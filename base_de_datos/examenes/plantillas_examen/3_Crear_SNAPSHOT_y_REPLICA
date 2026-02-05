@@ -1,0 +1,43 @@
+
+#!/bin/bash
+export AWS_PAGER=""
+
+# --- CONFIGURACIÓN ---
+echo "Introduce el ID de la RDS origen (ej: rds-privada-2):"
+read DB_SOURCE_ID
+
+SNAPSHOT_ID="snapshot-${DB_SOURCE_ID}-$(date +%Y%m%d-%H%M)"
+REPLICA_ID="${DB_SOURCE_ID}-replica"
+
+echo "--- 1. CREANDO SNAPSHOT ($SNAPSHOT_ID) ---"
+aws rds create-db-snapshot \
+    --db-instance-identifier "$DB_SOURCE_ID" \
+    --db-snapshot-identifier "$SNAPSHOT_ID"
+
+echo "Esperando a que el snapshot esté listo..."
+aws rds wait db-snapshot-completed --db-snapshot-identifier "$SNAPSHOT_ID"
+echo "Snapshot completado con éxito."
+
+echo "--- 2. CREANDO RÉPLICA (LECTURA/CACHÉ) ---"
+# Verificamos si la réplica ya existe para evitar errores
+REPLICA_EXISTS=$(aws rds describe-db-instances --db-instance-identifier "$REPLICA_ID" --query 'DBInstances[0].DBInstanceStatus' --output text 2>/dev/null)
+
+if [ "$REPLICA_EXISTS" == "None" ] || [ -z "$REPLICA_EXISTS" ]; then
+    echo "Lanzando creación de réplica: $REPLICA_ID..."
+    aws rds create-db-instance-read-replica \
+        --db-instance-identifier "$REPLICA_ID" \
+        --source-db-instance-identifier "$DB_SOURCE_ID" \
+        --db-instance-class db.t3.micro
+else
+    echo "La réplica $REPLICA_ID ya existe (Estado: $REPLICA_EXISTS)."
+fi
+
+echo "--- 3. COMPARATIVA DE ESTADOS ---"
+aws rds describe-db-instances \
+    --query 'DBInstances[?DBInstanceIdentifier==`'"$DB_SOURCE_ID"'` || DBInstanceIdentifier==`'"$REPLICA_ID"'`].[DBInstanceIdentifier, DBInstanceStatus, Endpoint.Address]' \
+    --output table
+
+echo "------------------------------------------------"
+echo "Snapshot creado: $SNAPSHOT_ID"
+echo "Réplica en proceso: $REPLICA_ID"
+echo "------------------------------------------------"

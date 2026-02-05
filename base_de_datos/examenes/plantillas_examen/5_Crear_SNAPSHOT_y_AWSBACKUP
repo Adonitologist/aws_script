@@ -1,0 +1,43 @@
+#!/bin/bash
+export AWS_PAGER=""
+
+echo "Introduce el ID de la RDS (ej: rds-publica-1):"
+read DB_ID
+
+TIMESTAMP=$(date +%Y%m%d-%H%M)
+SNAPSHOT_ID="snapshot-${DB_ID}-${TIMESTAMP}"
+VAULT_NAME="Vault-Laboratorio"
+PLAN_NAME="Plan-Backup-${DB_ID}"
+
+# Obtener ARNs
+DB_ARN=$(aws rds describe-db-instances --db-instance-identifier "$DB_ID" --query 'DBInstances[0].DBInstanceArn' --output text)
+ROLE_ARN=$(aws iam get-role --role-name LabRole --query 'Role.Arn' --output text)
+
+echo "--- 1. CREANDO SNAPSHOT MANUAL (RDS) ---"
+aws rds create-db-snapshot \
+    --db-instance-identifier "$DB_ID" \
+    --db-snapshot-identifier "$SNAPSHOT_ID"
+
+echo "--- 2. ASEGURANDO BACKUP VAULT ---"
+# Creamos el almacén porque el 'Default' no existe en este lab
+aws backup create-backup-vault --backup-vault-name "$VAULT_NAME" 2>/dev/null || echo "El Vault ya existe."
+
+echo "--- 3. CONFIGURANDO PLAN DE BACKUP ---"
+PLAN_ID=$(aws backup create-backup-plan \
+    --backup-plan "{\"BackupPlanName\":\"$PLAN_NAME\",\"Rules\":[{\"RuleName\":\"DailyBackups\",\"TargetBackupVaultName\":\"$VAULT_NAME\",\"ScheduleExpression\":\"cron(0 12 * * ? *)\",\"StartWindowMinutes\":60,\"CompletionWindowMinutes\":120,\"Lifecycle\":{\"DeleteAfterDays\":7}}]}" \
+    --query 'BackupPlanId' --output text)
+
+echo "Plan creado con ID: $PLAN_ID"
+
+echo "--- 4. ASIGNANDO RECURSO AL PLAN ---"
+# Corregido: create-backup-selection (faltaba 'backup-')
+aws backup create-backup-selection \
+    --backup-plan-id "$PLAN_ID" \
+    --backup-selection "{\"SelectionName\":\"Selection-${DB_ID}\",\"IamRoleArn\":\"$ROLE_ARN\",\"Resources\":[\"$DB_ARN\"]}"
+
+echo "------------------------------------------------"
+echo "¡TERMINADO CON ÉXITO!"
+echo "Vault: $VAULT_NAME"
+echo "Plan ID: $PLAN_ID"
+echo "Snapshot: $SNAPSHOT_ID"
+echo "------------------------------------------------"
