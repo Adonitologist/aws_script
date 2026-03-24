@@ -1,0 +1,76 @@
+import time  # <--- Added this missing import
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException, NoSuchElementException, WebDriverException
+
+# --- CONFIGURATION ---
+URL = "https://reservas.masqvida.es/paterna/login"
+USER = "YOUR_EMAIL"
+PASSWORD = "YOUR_PASSWORD"
+
+def make_reservation():
+    options = webdriver.ChromeOptions()
+    # options.add_argument("--headless") 
+    driver = webdriver.Chrome(options=options)
+    
+    status_message = "Pending"
+
+    try:
+        try:
+            driver.get(URL)
+        except WebDriverException:
+            status_message = "❌ Error: Could not connect to the website."
+            return status_message
+
+        # Login Phase
+        try:
+            wait = WebDriverWait(driver, 10)
+            user_field = wait.until(EC.presence_of_element_located((By.NAME, "usuario")))
+            pass_field = driver.find_element(By.NAME, "password")
+            
+            user_field.send_keys(USER)
+            pass_field.send_keys(PASSWORD)
+            driver.find_element(By.ID, "btn_login").click()
+        except TimeoutException:
+            status_message = "❌ Error: Login page elements not found."
+            return status_message
+
+        time.sleep(2)
+        if "login" in driver.current_url.lower():
+            status_message = "❌ Error: Login failed. Check credentials."
+            return status_message
+
+        # --- NEW: Navigation Phase ---
+        try:
+            # 1. Click on the "Reservas" or "Actividades" menu item
+            # You might need to change the text 'Mis Reservas' to whatever the button says
+            nav_btn = wait.until(EC.element_to_be_clickable((By.PARTIAL_LINK_TEXT, "Reservas")))
+            nav_btn.click()
+            
+            # 2. Find the specific slot (Example: 10:00 AM)
+            # This looks for a container that has "10:00" and then finds the button inside it
+            time.sleep(2) # Give the calendar a moment to render
+            
+            # TARGET_TIME = "10:00" 
+            # We use XPATH to find the row with your time and click the button next to it
+            target_slot = wait.until(EC.element_to_be_clickable((By.XPATH, "//tr[contains(., '20:00')]//button")))
+            target_slot.click()
+            
+            status_message = "✅ Success: Reservation for 10:00 completed!"
+            
+        except TimeoutException:
+            status_message = "⚠️ Error: Could not find the specific hour slot or navigation menu."
+
+    except Exception as e:
+        status_message = f"🚨 Unexpected Error: {str(e)}"
+    
+    finally:
+        driver.quit() # Cleanup happens here
+        
+    return status_message # <--- Now safely outside the finally block
+
+if __name__ == "__main__":
+    print(make_reservation())

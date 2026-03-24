@@ -1,0 +1,100 @@
+import boto3
+import paramiko
+import time
+import sys
+
+# ==========================================
+# DATOS DE CONEXIÓN
+# ==========================================
+REGION = 'us-east-1'
+ENDPOINT_RDS = "instancia-sin-cifrar.clnskhqmwfpy.us-east-1.rds.amazonaws.com"
+SSH_KEY_PATH = "/mnt/c/Users/juane/Downloads/labsuser.pem"
+ENV_NAME = 'EntornoPractica71'
+# ==========================================
+
+ec2 = boto3.client('ec2', region_name=REGION)
+c9 = boto3.client('cloud9', region_name=REGION)
+rds = boto3.client('rds', region_name=REGION)
+
+def pause(msg):
+    print(f"\n📸 [CAPTURA REQUERIDA]: {msg}")
+    input(">>> Presiona ENTER tras capturar para continuar...")
+
+def get_or_create_cloud9():
+    print(f"--- 1. Gestionando Entorno Cloud9 ---")
+    existing_envs = c9.list_environments()
+    env_id = None
+    if existing_envs.get('environmentIds'):
+        details = c9.describe_environments(environmentIds=existing_envs['environmentIds'])
+        for env in details['environments']:
+            if env['name'] == ENV_NAME:
+                env_id = env['id']
+                break
+    
+    if not env_id:
+        print("Creando entorno nuevo...")
+        res = c9.create_environment_ec2(name=ENV_NAME, instanceType='t2.micro', imageId='amazonlinux-2023-x86_64', connectionType='CONNECT_SSH')
+        env_id = res['environmentId']
+    
+    print(f"ID: {env_id}. Obteniendo IP...")
+    for _ in range(15):
+        time.sleep(5)
+        insts = ec2.describe_instances(Filters=[{'Name': 'tag:aws:cloud9:environment', 'Values': [env_id]}])
+        if insts['Reservations']:
+            inst = insts['Reservations'][0]['Instances'][0]
+            if 'PublicIpAddress' in inst and inst['State']['Name'] == 'running':
+                return inst['PublicIpAddress']
+    sys.exit("No se obtuvo IP. Revisa la consola EC2.")
+
+def run():
+    # RDS
+    try:
+        rds.modify_db_parameter_group(DBParameterGroupName='mysql84-slow-queries', Parameters=[{'ParameterName': 'slow_query_log', 'ParameterValue': '1', 'ApplyMethod': 'immediate'}])
+    except: pass
+    
+    cloud9_ip = get_or_create_cloud9()
+    print(f"--- Conectando a {cloud9_ip} ---")
+    
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    key = paramiko.RSAKey.from_private_key_file(SSH_KEY_PATH)
+    
+    # INTENTO DE CONEXIÓN DOBLE (ec2-user y ubuntu)
+    connected = False
+    for user in ["ec2-user", "ubuntu"]:
+        if connected: break
+        print(f"Probando usuario: {user}...")
+        for i in range(3):
+            try:
+                client.connect(hostname=cloud9_ip, username=user, pkey=key, timeout=10)
+                print(f"✅ Conectado como {user}")
+                connected = True
+                break
+            except:
+                time.sleep(5)
+
+    if not connected:
+        sys.exit("❌ Fallo total SSH. ¿Está el Labsuser.pem en la ruta correcta?")
+
+    print("🚀 Ejecutando comandos en Cloud9...")
+    # Comando que limpia todo y arranca el estrés
+    cmd = (
+        "sudo dnf install -y maven && "
+        "rm -rf ~/Proyecto && mkdir -p ~/Proyecto && cd ~/Proyecto && "
+        "mvn archetype:generate -DgroupId=com.practica -DartifactId=estres -DarchetypeArtifactId=maven-archetype-quickstart -DinteractiveMode=false && "
+        "cd estres && "
+        "echo '<project xmlns=\"http://maven.apache.org/POM/4.0.0\"><modelVersion>4.0.0</modelVersion><groupId>com.practica</groupId><artifactId>estres</artifactId><version>1.0</version><dependencies><dependency><groupId>mysql</groupId><artifactId>mysql-connector-java</artifactId><version>8.0.33</version></dependency></dependencies><build><plugins><plugin><groupId>org.codehaus.mojo</groupId><artifactId>exec-maven-plugin</artifactId><version>3.1.0</version><configuration><mainClass>com.practica.App</mainClass></configuration></plugin></plugins></build></project>' > pom.xml && "
+        f"echo \"package com.practica; import java.sql.*; import java.util.*; public class App {{ public static void main(String[] args) {{ try {{ List<Connection> c = new ArrayList<>(); for(int i=1; i<=60; i++) {{ c.add(DriverManager.getConnection(\\\"jdbc:mysql://{ENDPOINT_RDS}:3306/ciclismo\\\", \\\"admin\\\", \\\"Password123!\\\")); System.out.println(\\\"Conexion #\\\"+i+\\\" OK\\\"); }} Thread.sleep(300000); }} catch(Exception e) {{ e.printStackTrace(); }} }} }}\" > src/main/java/com/practica/App.java && "
+        "mvn compile && mvn exec:java"
+    )
+
+    stdin, stdout, stderr = client.exec_command(cmd)
+    for line in iter(stdout.readline, ""):
+        print(line.strip())
+        if "Conexion #60 OK" in line:
+            pause("ESTRÉS ACTIVO. Captura DatabaseConnections en CloudWatch.")
+            break
+    client.close()
+
+if __name__ == "__main__":
+    run()

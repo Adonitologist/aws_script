@@ -1,0 +1,78 @@
+import boto3
+import urllib.request
+from botocore.exceptions import ClientError
+
+# Configuración
+rds = boto3.client('rds', region_name='us-east-1')
+ec2_client = boto3.client('ec2', region_name='us-east-1')
+db_id = 'instancia-cifrado-transito'
+param_group_family = 'mysql8.4' 
+param_group_name = 'mysql84-ssl-forced'
+
+def get_public_ip():
+    return urllib.request.urlopen('https://checkip.amazonaws.com').read().decode('utf-8').strip()
+
+def pause(step_description):
+    print(f"\n✅ PASO COMPLETADO: {step_description}")
+    input("Presiona ENTER para capturar pantalla y continuar...")
+
+# 1. Verificar/Crear Instancia
+try:
+    rds.describe_db_instances(DBInstanceIdentifier=db_id)
+    print(f"Utilizando instancia existente: {db_id}")
+except ClientError:
+    print("Creando nueva instancia RDS con cifrado habilitado...")
+    rds.create_db_instance(
+        DBInstanceIdentifier=db_id, Engine='mysql', DBInstanceClass='db.t3.micro',
+        AllocatedStorage=20, MasterUsername='admin', MasterUserPassword='Password123!',
+        PubliclyAccessible=True, StorageEncrypted=True
+    )
+    waiter = rds.get_waiter('db_instance_available')
+    waiter.wait(DBInstanceIdentifier=db_id)
+
+# 2. Configurar Seguridad (Regla de entrada puerto 3306)
+response = rds.describe_db_instances(DBInstanceIdentifier=db_id)
+sg_id = response['DBInstances'][0]['VpcSecurityGroups'][0]['VpcSecurityGroupId']
+my_ip = f"{get_public_ip()}/32"
+
+try:
+    ec2_client.authorize_security_group_ingress(
+        GroupId=sg_id,
+        IpProtocol='tcp',
+        FromPort=3306,
+        ToPort=3306,
+        CidrIp=my_ip  # Corregido: Usando CidrIp directamente
+    )
+    print(f"Acceso permitido para la IP {my_ip}")
+except ClientError as e:
+    if e.response['Error']['Code'] == 'InvalidPermission.Duplicate':
+        print(f"La IP {my_ip} ya tiene acceso.")
+
+pause("Instancia y Seguridad listas. (Capturar pestaña Connectivity & Security)")
+
+# 3. Verificar/Crear Grupo de Parámetros
+try:
+    rds.describe_db_parameter_groups(DBParameterGroupName=param_group_name)
+    print(f"Utilizando grupo de parámetros: {param_group_name}")
+except ClientError:
+    print(f"Creando Parameter Group {param_group_name}...")
+    rds.create_db_parameter_group(
+        DBParameterGroupName=param_group_name, 
+        DBParameterGroupFamily=param_group_family,
+        Description='Forzar SSL'
+    )
+
+# 4. Forzar require_secure_transport = 1
+rds.modify_db_parameter_group(
+    DBParameterGroupName=param_group_name,
+    Parameters=[{'ParameterName': 'require_secure_transport', 'ParameterValue': '1', 'ApplyMethod': 'immediate'}]
+)
+pause("Parámetro require_secure_transport = 1. (Capturar listado de parámetros)")
+
+# 5. Asociar y Reiniciar
+rds.modify_db_instance(DBInstanceIdentifier=db_id, DBParameterGroupName=param_group_name, ApplyImmediately=True)
+print("Reiniciando instancia para aplicar cambios...")
+rds.reboot_db_instance(DBInstanceIdentifier=db_id)
+rds.get_waiter('db_instance_available').wait(DBInstanceIdentifier=db_id)
+
+pause("Instancia reiniciada y cifrada. (Capturar pestaña Configuration)")

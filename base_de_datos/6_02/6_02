@@ -1,0 +1,73 @@
+import boto3
+import time
+
+# Configuración inicial
+rds = boto3.client('rds', region_name='us-east-1') # Cambia la región si es necesario
+db_instance_id = 'instancia-sin-cifrar'
+snapshot_id = 'snapshot-sin-cifrar'
+snapshot_encrypted_id = 'snapshot-cifrado'
+db_instance_final_id = 'instancia-cifrada-final'
+
+def wait_for_rds(instance_id):
+    print(f"Esperando a que {instance_id} esté disponible...")
+    waiter = rds.get_waiter('db_instance_available')
+    waiter.wait(DBInstanceIdentifier=instance_id)
+
+def wait_for_snapshot(snap_id):
+    print(f"Esperando a que el snapshot {snap_id} esté disponible...")
+    waiter = rds.get_waiter('db_snapshot_completed')
+    waiter.wait(DBSnapshotIdentifier=snap_id)
+
+def pause(step_description):
+    print(f"\n✅ PASO COMPLETADO: {step_description}")
+    input("Presiona ENTER para capturar pantalla y continuar al siguiente paso...")
+
+# --- PASO 1 & 2: Crear Instancia RDS sin cifrar ---
+print("--- Creando instancia RDS MySQL (Free Tier, sin cifrar) ---")
+rds.create_db_instance(
+    DBInstanceIdentifier=db_instance_id,
+    Engine='mysql',
+    DBInstanceClass='db.t3.micro',
+    AllocatedStorage=20,
+    PubliclyAccessible=True,
+    MasterUsername='admin',
+    MasterUserPassword='Password123!',
+    StorageEncrypted=False, # Deshabilitar encriptado
+    EnablePerformanceInsights=False, # Deshabilitar insights
+    BackupRetentionPeriod=0
+)
+wait_for_rds(db_instance_id)
+pause("Instancia creada sin cifrar (Revisar Configuración -> Encryption: Disabled)")
+
+# --- PASO 3 & 4: Crear Instantánea (Snapshot) ---
+print(f"--- Creando snapshot de {db_instance_id} ---")
+rds.create_db_snapshot(
+    DBSnapshotIdentifier=snapshot_id,
+    DBInstanceIdentifier=db_instance_id
+)
+wait_for_snapshot(snapshot_id)
+pause("Snapshot inicial creado (Revisar KMS Key ID: None)")
+
+# --- PASO 5 & 6: Copiar Snapshot habilitando cifrado ---
+print(f"--- Copiando snapshot {snapshot_id} con cifrado habilitado ---")
+rds.copy_db_snapshot(
+    SourceDBSnapshotIdentifier=snapshot_id,
+    TargetDBSnapshotIdentifier=snapshot_encrypted_id,
+    KmsKeyId='alias/aws/rds', # Clave por defecto
+    CopyTags=True
+)
+wait_for_snapshot(snapshot_encrypted_id)
+pause("Copia de snapshot finalizada (Revisar KMS Key ID: aws/rds)")
+
+# --- PASO 7 & 8: Restaurar Instancia desde Snapshot cifrado ---
+print(f"--- Restaurando instancia cifrada desde el snapshot ---")
+rds.restore_db_instance_from_db_snapshot(
+    DBInstanceIdentifier=db_instance_final_id,
+    DBSnapshotIdentifier=snapshot_encrypted_id,
+    DBInstanceClass='db.t3.micro',
+    PubliclyAccessible=True
+)
+wait_for_rds(db_instance_final_id)
+pause("Instancia restaurada (Revisar Encryption: Enabled)")
+
+print("\n--- Proceso finalizado con éxito ---")
