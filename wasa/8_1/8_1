@@ -1,0 +1,477 @@
+import boto3
+import botocore
+import time
+
+# Configuración de variables según la práctica
+REGION = "us-east-1"
+VPC_ID = None  # Se detectará automáticamente la VPC por defecto
+SUBNETS = []   # Se detectarán automáticamente us-east-1a y us-east-1b
+LAB_ROLE_ARN = None  # Se detectará dinámicamente con el ID de cuenta real
+
+# Nombres estipulados en la práctica
+SG_ALB_NAME = "GS-ALB-Kanboard"
+SG_ECS_NAME = "GS-KANBOARD-SERVICE"
+SG_EFS_NAME = "GS-EFS-KANBOARD"
+SG_RDS_NAME = "GS-RDS-KANBOARD"
+
+EFS_NAME = "KanboardEFS"
+RDS_IDENTIFIER = "KanboardDB"
+ECS_CLUSTER_NAME = "KanboadCluster"
+ECS_TASK_FAMILY = "kanboard-task"
+ECS_INIT_TASK_FAMILY = "kanboard-db-init-task"  # Familia para la tarea de inicialización
+ECS_SERVICE_NAME = "kanboard-ha-service"
+ALB_NAME = "Kanboard-ALB"
+TG_NAME = "Kanboard-TG"
+
+# Inicialización de clientes
+ec2 = boto3.client('ec2', region_name=REGION)
+efs = boto3.client('efs', region_name=REGION)
+rds = boto3.client('rds', region_name=REGION)
+ecs = boto3.client('ecs', region_name=REGION)
+elbv2 = boto3.client('elbv2', region_name=REGION)
+autoscaling_app = boto3.client('application-autoscaling', region_name=REGION)
+sts = boto3.client('sts', region_name=REGION)
+iam = boto3.client('iam', region_name=REGION)  # Cliente IAM requerido para el Service-Linked Role
+
+def ensure_ecs_service_linked_role():
+    """
+    Verifica si existe el Service-Linked Role de ECS y lo crea si es necesario.
+    """
+    try:
+        iam.get_role(RoleName="AWSServiceRoleForECS")
+        print("[*] Service-Linked Role 'AWSServiceRoleForECS' detectado correctamente.")
+    except iam.exceptions.NoSuchEntityException:
+        print("[*] AWSServiceRoleForECS no encontrado. Creándolo de forma automática...")
+        try:
+            iam.create_service_linked_role(AWSServiceName="ecs.amazonaws.com")
+            print("[+] Service-Linked Role 'AWSServiceRoleForECS' creado con éxito.")
+            time.sleep(5)  # Breve pausa para la consistencia eventual de IAM
+        except botocore.exceptions.ClientError as e:
+            if e.response['Error']['Code'] != 'InvalidInput':  # Evita fallar si se creó simultáneamente
+                raise e
+
+def get_default_vpc_and_subnets():
+    global VPC_ID, SUBNETS
+    vpcs = ec2.describe_vpcs(Filters=[{'Name': 'is-default', 'Values': ['true']}])
+    VPC_ID = vpcs['Vpcs'][0]['VpcId']
+    
+    subnets_data = ec2.describe_subnets(Filters=[
+        {'Name': 'vpc-id', 'Values': [VPC_ID]},
+        {'Name': 'availability-zone', 'Values': [f'{REGION}a', f'{REGION}b']}
+    ])
+    SUBNETS = [sub['SubnetId'] for sub in subnets_data['Subnets']]
+    print(f"[*] Utilizando VPC por defecto: {VPC_ID} y Subnets: {SUBNETS}")
+
+def get_or_create_security_group(name, description):
+    try:
+        sg = ec2.describe_security_groups(GroupNames=[name])
+        sg_id = sg['SecurityGroups'][0]['GroupId']
+        print(f"[+] Grupo de Seguridad existente encontrado: {name} ({sg_id})")
+        return sg_id
+    except botocore.exceptions.ClientError as e:
+        if e.response['Error']['Code'] == 'InvalidGroup.NotFound':
+            sg = ec2.create_security_group(GroupName=name, Description=description, VpcId=VPC_ID)
+            sg_id = sg['GroupId']
+            print(f"[+] Grupo de Seguridad creado: {name} ({sg_id})")
+            return sg_id
+        raise e
+
+def configure_security_groups(sg_alb, sg_ecs, sg_efs, sg_rds):
+    def authorize_ingress(sg_id, ip_permissions):
+        try:
+            ec2.authorize_security_group_ingress(GroupId=sg_id, IpPermissions=ip_permissions)
+        except botocore.exceptions.ClientError as e:
+            if e.response['Error']['Code'] != 'InvalidPermission.Duplicate':
+                raise e
+
+    # Rule ALB: HTTP desde cualquier sitio
+    authorize_ingress(sg_alb, [{
+        'IpProtocol': 'tcp', 'FromPort': 80, 'ToPort': 80,
+        'IpRanges': [{'CidrIp': '0.0.0.0/0', 'Description': 'HTTP Anywhere'}]
+    }])
+    
+    # Rule ECS: HTTP desde el ALB
+    authorize_ingress(sg_ecs, [{
+        'IpProtocol': 'tcp', 'FromPort': 80, 'ToPort': 80,
+        'UserIdGroupPairs': [{'GroupId': sg_alb, 'Description': 'Trafico desde ALB'}]
+    }])
+    
+    # Rule EFS: NFS (2049) desde el ECS
+    authorize_ingress(sg_efs, [{
+        'IpProtocol': 'tcp', 'FromPort': 2049, 'ToPort': 2049,
+        'UserIdGroupPairs': [{'GroupId': sg_ecs, 'Description': 'NFS desde ECS Tasks'}]
+    }])
+    
+    # Rule RDS: MySQL (3306) desde el ECS
+    authorize_ingress(sg_rds, [{
+        'IpProtocol': 'tcp', 'FromPort': 3306, 'ToPort': 3306,
+        'UserIdGroupPairs': [{'GroupId': sg_ecs, 'Description': 'MySQL desde ECS Tasks'}]
+    }])
+    print("[*] Reglas de cruzado de Grupos de Seguridad verificadas/configuradas.")
+
+def get_or_create_efs(sg_efs):
+    fs_id = None
+    filesystems = efs.describe_file_systems()
+    for fs in filesystems['FileSystems']:
+        if fs.get('Name') == EFS_NAME:
+            fs_id = fs['FileSystemId']
+            print(f"[+] EFS existente encontrado: {EFS_NAME} ({fs_id})")
+            break
+            
+    if not fs_id:
+        fs = efs.create_file_system(
+            CreationToken=EFS_NAME,
+            PerformanceMode='generalPurpose',
+            ThroughputMode='bursting',
+            Encrypted=False,
+            Tags=[{'Key': 'Name', 'Value': EFS_NAME}]
+        )
+        fs_id = fs['FileSystemId']
+        print(f"[+] EFS Creado: {fs_id}. Esperando disponibilidad...")
+        while True:
+            info = efs.describe_file_systems(FileSystemId=fs_id)
+            status = info['FileSystems'][0]['LifeCycleState']
+            if status == 'available': break
+            time.sleep(5)
+
+    for subnet in SUBNETS:
+        targets = efs.describe_mount_targets(FileSystemId=fs_id)
+        already_mounted = any(t['SubnetId'] == subnet for t in targets['MountTargets'])
+        if not already_mounted:
+            try:
+                efs.create_mount_target(FileSystemId=fs_id, SubnetId=subnet, SecurityGroups=[sg_efs])
+                print(f"[+] Creado punto de montaje EFS en subnet: {subnet}")
+            except botocore.exceptions.ClientError as e:
+                print(f"[-] No se pudo montar en {subnet}: {e}")
+    return fs_id
+
+def get_or_create_rds(sg_rds):
+    try:
+        db_instance = rds.describe_db_instances(DBInstanceIdentifier=RDS_IDENTIFIER)
+        endpoint = db_instance['DBInstances'][0]['Endpoint']['Address']
+        print(f"[+] RDS existente encontrado: {RDS_IDENTIFIER} en {endpoint}")
+        return endpoint
+    except rds.exceptions.DBInstanceNotFoundFault:
+        print(f"[+] RDS no encontrado. Creando instancia MySQL {RDS_IDENTIFIER}...")
+        response = rds.create_db_instance(
+            DBInstanceIdentifier=RDS_IDENTIFIER,
+            MasterUsername='admin',
+            MasterUserPassword='mypassword', 
+            DBInstanceClass='db.t3.micro',
+            Engine='mysql',
+            AllocatedStorage=20,
+            StorageType='gp3',
+            VpcSecurityGroupIds=[sg_rds],
+            PubliclyAccessible=False,
+            AvailabilityZone=f'{REGION}a',
+            BackupRetentionPeriod=0,
+            CopyTagsToSnapshot=False,
+            MultiAZ=False
+        )
+        print("[*] Instancia RDS en proceso de creación. Esperando a que esté disponible...")
+        while True:
+            db_info = rds.describe_db_instances(DBInstanceIdentifier=RDS_IDENTIFIER)['DBInstances'][0]
+            if db_info['DBInstanceStatus'] == 'available':
+                endpoint = db_info['Endpoint']['Address']
+                print(f"[+] RDS disponible. Endpoint: {endpoint}")
+                return endpoint
+            time.sleep(15)
+
+def get_or_create_ecs_cluster():
+    clusters = ecs.list_clusters()['clusterArns']
+    for c_arn in clusters:
+        if ECS_CLUSTER_NAME in c_arn:
+            print(f"[+] Cluster ECS existente encontrado: {ECS_CLUSTER_NAME}")
+            return ECS_CLUSTER_NAME
+            
+    ecs.create_cluster(
+        clusterName=ECS_CLUSTER_NAME,
+        settings=[{'name': 'containerInsights', 'value': 'enabled'}]
+    )
+    print(f"[+] Cluster ECS creado: {ECS_CLUSTER_NAME}")
+    return ECS_CLUSTER_NAME
+
+def register_ecs_task_definition(efs_id, rds_endpoint):
+    db_url = f"mysql://admin:mypassword@{rds_endpoint}/kanboard"
+    
+    response = ecs.register_task_definition(
+        family=ECS_TASK_FAMILY,
+        taskRoleArn=LAB_ROLE_ARN,
+        executionRoleArn=LAB_ROLE_ARN,
+        networkMode='awsvpc',
+        containerDefinitions=[
+            {
+                'name': 'kanboard',
+                'image': 'kanboard/kanboard:latest',
+                'cpu': 256,
+                'memory': 512,
+                'essential': True,
+                'portMappings': [
+                    {
+                        'name': 'kanboard-80-tcp',
+                        'containerPort': 80,
+                        'hostPort': 80,
+                        'protocol': 'tcp',
+                        'appProtocol': 'http'
+                    }
+                ],
+                'environment': [
+                    {'name': 'DATABASE_URL', 'value': db_url}
+                ],
+                'mountPoints': [
+                    {
+                        'sourceVolume': 'kanboard-data',
+                        'containerPath': '/var/www/app/data',
+                        'readOnly': False
+                    }
+                ]
+            }
+        ],
+        volumes=[
+            {
+                'name': 'kanboard-data',
+                'efsVolumeConfiguration': {
+                    'fileSystemId': efs_id,
+                    'transitEncryption': 'ENABLED'
+                }
+            }
+        ],
+        requiresCompatibilities=['FARGATE'],
+        cpu='256',
+        memory='512'
+    )
+    task_def_arn = response['taskDefinition']['taskDefinitionArn']
+    print(f"[+] Nueva revisión de Definición de Tarea registrada: {task_def_arn}")
+    return task_def_arn
+
+def register_ecs_init_task_definition(rds_endpoint):
+    response = ecs.register_task_definition(
+        family=ECS_INIT_TASK_FAMILY,
+        taskRoleArn=LAB_ROLE_ARN,
+        executionRoleArn=LAB_ROLE_ARN,
+        networkMode='awsvpc',
+        containerDefinitions=[
+            {
+                'name': 'db-init',
+                'image': 'mysql:8.0',
+                'cpu': 256,
+                'memory': 512,
+                'essential': True,
+                'command': [
+                    'sh', '-c', 
+                    'mysql -h $KANBOARD_DB_HOST -u $KANBOARD_DB_USER -p$KANBOARD_DB_PASSWORD -e "CREATE DATABASE IF NOT EXISTS kanboard;"'
+                ],
+                'environment': [
+                    {'name': 'KANBOARD_DB_HOST', 'value': rds_endpoint},
+                    {'name': 'KANBOARD_DB_USER', 'value': 'admin'},
+                    {'name': 'KANBOARD_DB_PASSWORD', 'value': 'mypassword'}
+                ]
+            }
+        ],
+        requiresCompatibilities=['FARGATE'],
+        cpu='256',
+        memory='512'
+    )
+    return response['taskDefinition']['taskDefinitionArn']
+
+def run_db_initialization_task(init_task_def_arn, sg_ecs):
+    print("[*] Lanzando contenedor efímero nativo (MySQL 8.0) para inicializar la base de datos 'kanboard'...")
+    try:
+        ecs.run_task(
+            cluster=ECS_CLUSTER_NAME,
+            launchType='FARGATE',
+            taskDefinition=init_task_def_arn,
+            count=1,
+            networkConfiguration={
+                'awsvpcConfiguration': {
+                    'subnets': SUBNETS,
+                    'securityGroups': [sg_ecs],
+                    'assignPublicIp': 'ENABLED'
+                }
+            }
+        )
+        print("[+] Comando de inicialización enviado exitosamente al clúster.")
+    except Exception as e:
+        print(f"[-] No se pudo automatizar el aprovisionamiento de la base de datos: {e}")
+
+def get_or_create_alb(sg_alb):
+    # ALB
+    alb_arn = None
+    try:
+        lbs = elbv2.describe_load_balancers(Names=[ALB_NAME])
+        alb_arn = lbs['LoadBalancers'][0]['LoadBalancerArn']
+        dns_name = lbs['LoadBalancers'][0]['DNSName']
+        print(f"[+] ALB existente encontrado: {ALB_NAME} ({dns_name})")
+    except elbv2.exceptions.LoadBalancerNotFoundException:
+        print(f"[+] ALB no encontrado. Creando {ALB_NAME}...")
+        lb = elbv2.create_load_balancer(
+            Name=ALB_NAME,
+            Subnets=SUBNETS,
+            SecurityGroups=[sg_alb],
+            Scheme='internet-facing',
+            Type='application',
+            IpAddressType='ipv4'
+        )
+        alb_arn = lb['LoadBalancers'][0]['LoadBalancerArn']
+        dns_name = lb['LoadBalancers'][0]['DNSName']
+        print(f"[+] ALB Creado exitosamente. DNS: {dns_name}")
+
+    # Target Group
+    tg_arn = None
+    try:
+        tgs = elbv2.describe_target_groups(Names=[TG_NAME])
+        tg_arn = tgs['TargetGroups'][0]['TargetGroupArn']
+        print(f"[+] Target Group existente encontrado: {TG_NAME}")
+    except elbv2.exceptions.TargetGroupNotFoundException:
+        tg = elbv2.create_target_group(
+            Name=TG_NAME,
+            Protocol='HTTP',
+            Port=80,
+            VpcId=VPC_ID,
+            TargetType='ip',
+            HealthCheckProtocol='HTTP',
+            HealthCheckPort='80',
+            HealthCheckPath='/',
+            HealthCheckIntervalSeconds=30,
+            HealthCheckTimeoutSeconds=5,
+            HealthyThresholdCount=3,
+            UnhealthyThresholdCount=3,
+            Matcher={'HttpCode': '200,302'}
+        )
+        tg_arn = tg['TargetGroups'][0]['TargetGroupArn']
+        print(f"[+] Target Group creado con códigos de éxito HTTP 200,302.")
+
+    # Listener
+    listeners = elbv2.describe_listeners(LoadBalancerArn=alb_arn)['Listeners']
+    if not listeners:
+        elbv2.create_listener(
+            LoadBalancerArn=alb_arn,
+            Protocol='HTTP',
+            Port=80,
+            DefaultActions=[{'Type': 'forward', 'TargetGroupArn': tg_arn}]
+        )
+        print("[+] Listener HTTP en puerto 80 asociado al Target Group.")
+        
+    return tg_arn
+
+def get_or_create_ecs_service(cluster, task_def, tg_arn, sg_ecs):
+    try:
+        srv = ecs.describe_services(cluster=cluster, services=[ECS_SERVICE_NAME])
+        if srv['services'] and srv['services'][0]['status'] != 'INACTIVE':
+            print(f"[+] El servicio ECS HA '{ECS_SERVICE_NAME}' ya existe. Actualizando a última definición de tarea...")
+            ecs.update_service(
+                cluster=cluster,
+                service=ECS_SERVICE_NAME,
+                taskDefinition=task_def
+            )
+            return
+    except Exception:
+        pass
+
+    print(f"[+] Creando nuevo servicio ECS de Alta Disponibilidad: {ECS_SERVICE_NAME}...")
+    ecs.create_service(
+        cluster=cluster,
+        serviceName=ECS_SERVICE_NAME,
+        taskDefinition=task_def,
+        loadBalancers=[
+            {
+                'targetGroupArn': tg_arn,
+                'containerName': 'kanboard',
+                'containerPort': 80
+            }
+        ],
+        desiredCount=2,
+        launchType='FARGATE',
+        platformVersion='LATEST',
+        healthCheckGracePeriodSeconds=120,
+        networkConfiguration={
+            'awsvpcConfiguration': {
+                'subnets': SUBNETS,
+                'securityGroups': [sg_ecs],
+                'assignPublicIp': 'ENABLED'
+            }
+        },
+        deploymentConfiguration={
+            'maximumPercent': 200,
+            'minimumHealthyPercent': 100
+        }
+    )
+    print(f"[+] Servicio ECS '{ECS_SERVICE_NAME}' desplegado de forma correcta.")
+
+def configure_auto_scaling(cluster):
+    resource_id = f"service/{cluster}/{ECS_SERVICE_NAME}"
+    
+    try:
+        autoscaling_app.register_scalable_target(
+            ServiceNamespace='ecs',
+            ResourceId=resource_id,
+            ScalableDimension='ecs:service:DesiredCount',
+            MinCapacity=2,
+            MaxCapacity=8,
+        )
+        print("[+] Target de Auto Escalado registrado (Min: 2, Max: 8).")
+    except Exception as e:
+        print(f"[*] Target de Auto Escalado ya registrado o error: {e}")
+
+    autoscaling_app.put_scaling_policy(
+        PolicyName='CpuTargetScaling',
+        ServiceNamespace='ecs',
+        ResourceId=resource_id,
+        ScalableDimension='ecs:service:DesiredCount',
+        PolicyType='TargetTrackingScaling',
+        TargetTrackingScalingPolicyConfiguration={
+            'TargetValue': 50.0,
+            'PredefinedMetricSpecification': {
+                'PredefinedMetricType': 'ECSServiceAverageCPUUtilization'
+            },
+            'ScaleOutCooldown': 60,
+            'ScaleInCooldown': 60
+        }
+    )
+    print("[+] Política de Auto Escalado 'CpuTargetScaling' al 50% de CPU aplicada.")
+
+def main():
+    global LAB_ROLE_ARN
+    print("=== INICIANDO DESPLIEGUE AUTOMATIZADO DE LA PRÁCTICA KANBOARD ===")
+    
+    account_id = sts.get_caller_identity()['Account']
+    LAB_ROLE_ARN = f"arn:aws:iam::{account_id}:role/LabRole"
+    print(f"[*] Identificado ID de cuenta AWS real: {account_id}")
+    
+    # NUEVO: Asegurarse de que el Service-Linked Role de ECS exista en este nuevo lab
+    ensure_ecs_service_linked_role()
+    
+    get_default_vpc_and_subnets()
+    
+    # 1. Grupos de Seguridad
+    sg_alb = get_or_create_security_group(SG_ALB_NAME, "GS para el Application Load Balancer")
+    sg_ecs = get_or_create_security_group(SG_ECS_NAME, "GS para las tareas contenerizadas de Kanboard")
+    sg_efs = get_or_create_security_group(SG_EFS_NAME, "GS para los Mount Targets del almacenamiento EFS")
+    sg_rds = get_or_create_security_group(SG_RDS_NAME, "GS para la Base de Datos RDS MySQL")
+    configure_security_groups(sg_alb, sg_ecs, sg_efs, sg_rds)
+    
+    # 2. Persistencia: Almacenamiento de archivos EFS
+    efs_id = get_or_create_efs(sg_efs)
+    
+    # 3. Persistencia: Base de Datos Relacional RDS
+    rds_endpoint = get_or_create_rds(sg_rds)
+    
+    # 4. Cómputo y Orquestación: Cluster ECS Fargate
+    cluster = get_or_create_ecs_cluster()
+    task_def = register_ecs_task_definition(efs_id, rds_endpoint)
+    
+    # Registrar e invocar la definición de tarea secundaria nativa de inicialización SQL
+    init_task_def = register_ecs_init_task_definition(rds_endpoint)
+    run_db_initialization_task(init_task_def, sg_ecs)
+    
+    # 5. Red y Balanceo: ALB y Target Group
+    tg_arn = get_or_create_alb(sg_alb)
+    
+    # 6. Despliegue del Servicio de Alta Disponibilidad y su Autoescalado
+    get_or_create_ecs_service(cluster, task_def, tg_arn, sg_ecs)
+    configure_auto_scaling(cluster)
+    
+    print("\n=== DESPLIEGUE DE INFRAESTRUCTURA FINALIZADO CON ÉXITO ===")
+
+if __name__ == "__main__":
+    main()
