@@ -1,8 +1,17 @@
 terraform {
+  backend "s3" {
+    bucket         = "juaneslava-terraform-state-2026"
+    key            = "dev/terraform.tfstate"
+    region         = "us-east-1"
+  }
   required_providers {
     aws = {
       source  = "hashicorp/aws"
       version = "~> 5.0"
+    }
+    archive = {
+      source  = "hashicorp/archive"
+      version = "~> 2.4"
     }
   }
 }
@@ -23,13 +32,21 @@ resource "aws_dynamodb_table" "counter_table" {
   }
 }
 
-# 2. Lambda Function Definition
+# 2. Dynamic Lambda Archive and Function Definition
+data "archive_file" "lambda_zip" {
+  type        = "zip"
+  source_dir  = "${path.module}/backend"
+  output_path = "${path.module}/lambda_function_payload.zip"
+}
+
 resource "aws_lambda_function" "resume_counter_lambda" {
-  function_name = "cloud-resume-counter-api"
-  role          = "arn:aws:iam::154932391641:role/service-role/cloud-resume-counter-api-role-qg1yriwm"
-  handler       = "lambda_function.lambda_handler"
-  runtime       = "python3.13"
-  filename      = "dummy.zip"
+  function_name    = "cloud-resume-counter-api"
+  role             = "arn:aws:iam::154932391641:role/service-role/cloud-resume-counter-api-role-qg1yriwm"
+  handler          = "lambda_function.lambda_handler"
+  runtime          = "python3.13"
+  
+  filename         = data.archive_file.lambda_zip.output_path
+  source_code_hash = data.archive_file.lambda_zip.output_base64sha256
 }
 
 # 3. HTTP API Gateway Definition
@@ -57,6 +74,7 @@ resource "aws_apigatewayv2_route" "counter_route" {
   route_key = "GET /counter"
   target    = "integrations/${aws_apigatewayv2_integration.lambda_integration.id}"
 }
+
 # 6. Security Permission for API Gateway to invoke Lambda
 resource "aws_lambda_permission" "api_gateway_permission" {
   statement_id  = "AllowExecutionFromAPIGateway"
@@ -66,13 +84,10 @@ resource "aws_lambda_permission" "api_gateway_permission" {
   source_arn    = "${aws_apigatewayv2_api.resume_api.execution_arn}/*/*"
 }
 
-
-
 # ==========================================
 # PHASE 2: FRONTEND S3 + CLOUDFRONT DISTRIBUTION
 # ==========================================
 
-# Secondary Provider for the Stockholm Region
 provider "aws" {
   alias  = "stockholm"
   region = "eu-north-1"
@@ -80,12 +95,10 @@ provider "aws" {
 
 # 7. S3 Bucket for Static Website Files
 resource "aws_s3_bucket" "resume_bucket" {
-  provider      = aws.stockholm  # <--- Add this line here
+  provider      = aws.stockholm
   bucket        = "juaneslava-cloud-resume-2026"
   force_destroy = false
 }
-
-
 
 # 8. CloudFront Origin Access Control (OAC) for secure S3 connectivity
 resource "aws_cloudfront_origin_access_control" "oac" {
@@ -161,22 +174,16 @@ resource "aws_s3_bucket_policy" "allow_access_from_cloudfront" {
   })
 }
 
-
-
-
 # ==========================================
 # PHASE 3: CI/CD AUTOMATION (OIDC AUTHENTICATION)
 # ==========================================
 
-# 11. GitHub Actions OIDC Identity Provider Trust
 resource "aws_iam_openid_connect_provider" "github" {
   url             = "https://token.actions.githubusercontent.com"
   client_id_list  = ["sts.amazonaws.com"]
-  # Updated with current active GitHub Actions intermediate root CA certificate hashes
   thumbprint_list = ["6938fd4d98bab03faadb97b34396831e3780aea1", "1c58a3a8518e8759bf075b76b750d4f2df264fcd"]
 }
 
-# 12. IAM Role for GitHub Actions Deployment Execution
 resource "aws_iam_role" "github_actions_role" {
   name = "github-actions-cloud-resume-role"
 
@@ -194,7 +201,6 @@ resource "aws_iam_role" "github_actions_role" {
             "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
           }
           StringLike = {
-            # Matches exactly your GitHub account and specific repository name mapping
             "token.actions.githubusercontent.com:sub" = "repo:Adonitologist/aws_script:*"
           }
         }
@@ -203,7 +209,6 @@ resource "aws_iam_role" "github_actions_role" {
   })
 }
 
-# 13. IAM Policy Granting Deploy Privileges (S3 Sync + CloudFront Cache Invalidation)
 resource "aws_iam_role_policy" "github_actions_policy" {
   name = "github-actions-deploy-policy"
   role = aws_iam_role.github_actions_role.id
@@ -235,8 +240,15 @@ resource "aws_iam_role_policy" "github_actions_policy" {
   })
 }
 
-# Output the IAM Role ARN so we can easily copy it into our GitHub Actions configuration file later
+# S3 Bucket created dynamically to manage remote infrastructure state data safely
+resource "aws_s3_bucket" "terraform_state" {
+  bucket        = "juaneslava-terraform-state-2026"
+  force_destroy = false
+}
+
 output "github_actions_role_arn" {
   value       = aws_iam_role.github_actions_role.arn
   description = "The target IAM Role ARN for the GitHub Actions workflow configuration"
 }
+
+
