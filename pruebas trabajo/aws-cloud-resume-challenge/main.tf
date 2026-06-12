@@ -100,7 +100,7 @@ resource "aws_s3_bucket" "resume_bucket" {
   force_destroy = false
 }
 
-# 8. CloudFront Origin Access Control (OAC) for secure S3 connectivity
+# 8. CloudFront Origin Access Control (OAC)
 resource "aws_cloudfront_origin_access_control" "oac" {
   name                              = "s3-resume-oac"
   description                       = "OAC Protocol for locking down resume storage bucket access"
@@ -149,7 +149,7 @@ resource "aws_cloudfront_distribution" "resume_cdn" {
   }
 }
 
-# 10. S3 Bucket Policy allowing reads strictly from CloudFront CDN
+# 10. S3 Bucket Policy
 resource "aws_s3_bucket_policy" "allow_access_from_cloudfront" {
   provider = aws.stockholm 
   bucket   = aws_s3_bucket.resume_bucket.id
@@ -217,30 +217,26 @@ resource "aws_iam_role_policy" "github_actions_policy" {
     Version = "2012-10-17"
     Statement = [
       {
+        # Permissions for Terraform State S3 Bucket
         Effect = "Allow"
-        Action = [
-          "s3:PutObject",
-          "s3:GetObject",
-          "s3:ListBucket",
-          "s3:DeleteObject"
-        ]
-        Resource = [
-          "arn:aws:s3:::juaneslava-cloud-resume-2026",
-          "arn:aws:s3:::juaneslava-cloud-resume-2026/*"
-        ]
+        Action = ["s3:ListBucket"]
+        Resource = ["arn:aws:s3:::juaneslava-terraform-state-2026"]
       },
       {
         Effect = "Allow"
-        Action = [
-          "cloudfront:CreateInvalidation"
-        ]
-        Resource = "arn:aws:cloudfront::154932391641:distribution/E3CSQJMYF4ECSE"
+        Action = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"]
+        Resource = ["arn:aws:s3:::juaneslava-terraform-state-2026/*"]
+      },
+      {
+        # Permissions for Frontend & Infrastructure
+        Effect = "Allow"
+        Action = ["*"]
+        Resource = ["*"]
       }
     ]
   })
 }
 
-# S3 Bucket created dynamically to manage remote infrastructure state data safely
 resource "aws_s3_bucket" "terraform_state" {
   bucket        = "juaneslava-terraform-state-2026"
   force_destroy = false
@@ -250,5 +246,3 @@ output "github_actions_role_arn" {
   value       = aws_iam_role.github_actions_role.arn
   description = "The target IAM Role ARN for the GitHub Actions workflow configuration"
 }
-
-
