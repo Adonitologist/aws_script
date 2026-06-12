@@ -4,35 +4,32 @@ on:
   push:
     branches:
       - main
-    # Only triggers when changes are made inside your resume web code folder
+    # Updated to watch your correct frontend assets folder
     paths:
-      - 'pruebas trabajo/aws-cloud-resume-challenge/**'
+      - 'pruebas trabajo/aws-cloud-resume-challenge/frontend/**'
 
 permissions:
-  id-token: write # Required for requesting the AWS JWT OIDC token
-  contents: read  # Required to check out code
+  id-token: write 
+  contents: read  
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      # 1. Pull down the code repository
       - name: Checkout Repository Code
         uses: actions/checkout@v4
 
-      # 2. Authenticate securely with AWS using zero-password OIDC
       - name: Authenticate with AWS OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::154932391641:role/github-actions-cloud-resume-role
-          aws-region: eu-north-1 # Targeted directly to Stockholm for S3
+          aws-region: eu-north-1 
 
-      # 3. Synchronize your static files to the S3 Bucket
+      # Updated to sync from the correct source folder
       - name: Deploy Frontend Files to S3 Bucket
         run: |
-          aws s3 sync "./pruebas trabajo/aws-cloud-resume-challenge/website" s3://juaneslava-cloud-resume-2026 --delete
+          aws s3 sync "./pruebas trabajo/aws-cloud-resume-challenge/frontend" s3://juaneslava-cloud-resume-2026 --delete
 
-      # 4. Clear the global Edge Cache so updates appear immediately
       - name: Invalidate CloudFront Global Cache Distribution
         run: |
           aws cloudfront create-invalidation --distribution-id E3CSQJMYF4ECSE --paths "/*"
