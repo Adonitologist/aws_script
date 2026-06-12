@@ -15,7 +15,8 @@ class TestResumeCounter(unittest.TestCase):
             AttributeDefinitions=[{'AttributeName': 'id', 'AttributeType': 'S'}],
             BillingMode='PAY_PER_REQUEST'
         )
-        table.put_item(Item={'id': 'view-count', 'count': Decimal(10)})
+        # Use 'visitors' to match your lambda_function.py
+        table.put_item(Item={'id': 'visitors', 'count': Decimal(10)})
 
         # 2. Invoke Handler
         event = {}
@@ -25,7 +26,7 @@ class TestResumeCounter(unittest.TestCase):
         self.assertEqual(response['statusCode'], 200)
         
         # Verify increment
-        updated_item = table.get_item(Key={'id': 'view-count'})['Item']
+        updated_item = table.get_item(Key={'id': 'visitors'})['Item']
         self.assertEqual(updated_item['count'], Decimal(11))
 
 if __name__ == '__main__':
