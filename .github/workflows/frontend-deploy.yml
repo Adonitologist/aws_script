@@ -1,19 +1,55 @@
-name: Cloud Resume Frontend Deployment
+name: Cloud Resume Dual Pipeline Deployment
 
 on:
   push:
     branches:
       - main
-    # Updated to watch your correct frontend assets folder
-    paths:
-      - 'pruebas trabajo/aws-cloud-resume-challenge/frontend/**'
 
 permissions:
-  id-token: write 
-  contents: read  
+  id-token: write
+  contents: read
 
 jobs:
-  deploy:
+  # ==========================================
+  # TASK 1: TESTING & INFRASTRUCTURE DEPLOYMENT
+  # ==========================================
+  deploy-backend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: "pruebas trabajo/aws-cloud-resume-challenge"
+    steps:
+      - name: Checkout Repository Code
+        uses: actions/checkout@v4
+
+      - name: Authenticate with AWS OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::154932391641:role/github-actions-cloud-resume-role
+          aws-region: us-east-1
+
+      - name: Install Test Dependencies
+        run: pip install moto boto3
+
+      - name: Run Backend Unit Tests
+        run: python backend/test_lambda.py
+
+      - name: Install and Setup Terraform Engine
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.7.0
+
+      - name: Initialize Backend Modules
+        run: terraform init
+
+      - name: Apply Infrastructure Changes
+        run: terraform apply -auto-approve
+
+  # ==========================================
+  # TASK 2: FRONTEND ASSETS DEPLOYMENT
+  # ==========================================
+  deploy-frontend:
+    needs: deploy-backend
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repository Code
@@ -23,9 +59,8 @@ jobs:
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::154932391641:role/github-actions-cloud-resume-role
-          aws-region: eu-north-1 
+          aws-region: eu-north-1
 
-      # Updated to sync from the correct source folder
       - name: Deploy Frontend Files to S3 Bucket
         run: |
           aws s3 sync "./pruebas trabajo/aws-cloud-resume-challenge/frontend" s3://juaneslava-cloud-resume-2026 --delete
