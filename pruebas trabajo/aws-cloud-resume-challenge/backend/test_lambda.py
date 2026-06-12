@@ -1,5 +1,6 @@
 import unittest
 import boto3
+from decimal import Decimal
 from moto import mock_aws
 from lambda_function import lambda_handler
 
@@ -14,7 +15,7 @@ class TestResumeCounter(unittest.TestCase):
             AttributeDefinitions=[{'AttributeName': 'id', 'AttributeType': 'S'}],
             BillingMode='PAY_PER_REQUEST'
         )
-        table.put_item(Item={'id': 'view-count', 'count': 10})
+        table.put_item(Item={'id': 'view-count', 'count': Decimal(10)})
 
         # 2. Invoke Handler
         event = {}
@@ -25,7 +26,7 @@ class TestResumeCounter(unittest.TestCase):
         
         # Verify increment
         updated_item = table.get_item(Key={'id': 'view-count'})['Item']
-        self.assertEqual(updated_item['count'], 11)
+        self.assertEqual(updated_item['count'], Decimal(11))
 
 if __name__ == '__main__':
     unittest.main()
